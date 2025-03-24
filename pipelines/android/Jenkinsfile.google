@@ -1,0 +1,152 @@
+// pipelines/android/Jenkinsfile.google
+@Library('jenkins-shared-library') _
+
+pipeline {
+    agent { label 'macMini' }
+    
+    environment {
+        PLATFORM = 'Google'
+        ANDROID_SDK_ROOT = "${env.HOME}/Library/Android/sdk"
+        NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
+        bundle_isSucceed = false
+        apk_isSucceed = false
+        RADIOPLAYER_DIR = "radioplayer-app"  // Directory dedicata per il progetto Radioplayer
+    }
+    
+     parameters {
+        string(
+            name: 'repoBranch',
+            defaultValue: 'main',
+            description: 'Branch to build'
+        )
+        booleanParam(
+            name: 'staging',
+            defaultValue: false,
+            description: 'upload build in staging/ folder on Radioplayer Google Drive project'
+        )
+    }
+    
+    stages {
+        stage('Radioplayer Gitlab clone repository') {
+            steps {
+                cleanWs()
+                 slackNotifier(status: 'STARTED')
+                script {
+
+                    // Crea una directory separata per il progetto Radioplayer
+                    sh "mkdir -p ${env.RADIOPLAYER_DIR}"
+                    dir(env.RADIOPLAYER_DIR) {
+                        git branch: "${params.repoBranch ?: 'main'}",
+                            credentialsId: 'automation-cicd-token',
+                            url: 'https://gitlab.com/radioplayer-mobile-apps/core/radioplayer.git'
+                    }
+                }
+            }
+        }
+
+        stage('Build Android') {
+            steps {
+                script {
+                    // Esegui il build nella directory di Radioplayer
+                    dir(env.RADIOPLAYER_DIR) {
+                        def buildResult = androidBuilder(
+                            platform: env.PLATFORM,
+                            buildTypes: ['bundle', 'apk'],
+                            gradleProject: ':app',
+                            cleanWorkspace: false,
+                            timeoutMinutes: 30,
+                            retryCount: 3,
+                            gradleOpts: '--no-daemon'
+                        )
+                        
+                        bundle_isSucceed = buildResult.bundle
+                        apk_isSucceed = buildResult.apk
+                        
+                        if (!buildResult.bundle && !buildResult.apk) {
+                            error "Both bundle and APK builds failed"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Sign') {
+            parallel {
+                stage('Sign Bundle') {
+                    when { 
+                        expression { return bundle_isSucceed } 
+                    }
+                    steps {
+                        script {
+                            dir(env.RADIOPLAYER_DIR) {
+                                androidSigner(
+                                    type: 'bundle',
+                                    inputFile: "${WORKSPACE}/${env.RADIOPLAYER_DIR}/android/app/build/outputs/bundle/release/*.aab",
+                                    outputFile: "${WORKSPACE}/${env.RADIOPLAYER_DIR}/signedMobile.aab"
+                                )
+                            }
+                        }
+                    }
+                }
+                
+                stage('Sign APK') {
+                    when { 
+                        expression { return apk_isSucceed } 
+                    }
+                    steps {
+                        script {
+                            dir(env.RADIOPLAYER_DIR) {
+                                androidSigner(
+                                    type: 'apk',
+                                    inputFile: "${WORKSPACE}/${env.RADIOPLAYER_DIR}/android/app/build/outputs/apk/release/*.apk",
+                                    outputFile: "${WORKSPACE}/${env.RADIOPLAYER_DIR}/app-release.apk"
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                dir(env.RADIOPLAYER_DIR) {
+                    def VERSION = sh(
+                        script: '''
+                            cd android/app
+                            cat build.gradle | grep versionName | awk '{if (length($2) < 9 && length($2) > 3) print $2}'
+                        ''',
+                        returnStdout: true
+                    ).trim().replace('"','').replace('.','_')
+                    
+                    def versionCode = sh(
+                        script: '''
+                            cd android/app
+                            cat build.gradle | grep versionCode | awk 'NR==1{print $2}'
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Build completed for version: ${VERSION} (${versionCode})"
+                }
+                cleanWs()
+
+            }
+        }
+      success {
+                slackNotifier(status: 'SUCCESS')
+        }
+        failure {
+            
+                slackNotifier(status: 'FAILURE')
+           
+        }
+        aborted {
+            
+                slackNotifier(status: 'ABORTED')
+             
+        }
+    }
+}

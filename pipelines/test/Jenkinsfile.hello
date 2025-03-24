@@ -1,0 +1,18 @@
+@Library('jenkins-shared-library') _
+
+pipeline {
+    agent
+    {
+        label 'ec2-docker-slave'
+    }
+    stages {
+        stage('Greeting') {
+            steps {
+                script {
+                    def result = helloWorld('Jenkins')
+                    echo "Result: ${result}"
+                }
+            }
+        }
+    }
+}
